@@ -1,7 +1,22 @@
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="EduMath API")
+
+# Разрешаем локальному Frontend обращаться к Backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ],
+    allow_methods=["GET"],
+    allow_headers=["*"]
+)
+
 
 # Пока используем тестовые курсы
 courses = [
@@ -18,9 +33,27 @@ courses = [
 ]
 
 
+
 @app.get("/courses")
-def get_courses():
-    return courses
+def get_courses(search: str | None = None, category: str | None = None):
+    result = courses
+
+    # Поиск по названию курса
+    if search:
+        result = [
+            course for course in result
+            if search.lower() in course["title"].lower()
+        ]
+
+    # Фильтрация по категории
+    if category:
+        result = [
+            course for course in result
+            if category.lower() in course["category"].lower()
+        ]
+
+    return result
+
 
 
 @app.get("/recommendations")
