@@ -1,10 +1,27 @@
 
-from fastapi import FastAPI
+import sqlite3
+import sys
+from functools import lru_cache
+from pathlib import Path
+from threading import Lock
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = Path(__file__).resolve().parent / "db.sqlite3"
+DATA_DIR = PROJECT_ROOT / "data" / "raw"
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from ml.main import CourseRecommender
+
 
 app = FastAPI(title="EduMath API")
 
-# Разрешаем локальному Frontend обращаться к Backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -13,58 +30,144 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173"
     ],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"]
 )
 
 
-# Пока используем тестовые курсы
-courses = [
-    {"course_id": 1, "title": "Основы Python", "category": "Программирование"},
-    {"course_id": 2, "title": "Основы Java", "category": "Программирование"},
-    {"course_id": 3, "title": "Машинное обучение", "category": "Искусственный интеллект"},
-    {"course_id": 4, "title": "Введение в SQL", "category": "Базы данных"},
-    {"course_id": 5, "title": "Веб-разработка", "category": "Программирование"},
-    {"course_id": 6, "title": "Нейронные сети", "category": "Искусственный интеллект"},
-    {"course_id": 7, "title": "Основы HTML и CSS", "category": "Веб-разработка"},
-    {"course_id": 8, "title": "Анализ данных", "category": "Data Science"},
-    {"course_id": 9, "title": "Алгоритмы и структуры данных", "category": "Программирование"},
-    {"course_id": 10, "title": "Основы математики", "category": "Математика"}
-]
+class Interaction(BaseModel):
+    user_id: int = Field(gt=0)
+    course_id: int = Field(gt=0)
+    weight: float = Field(gt=0, le=1)
 
+
+# Загружаем модель один раз
+@lru_cache(maxsize=1)
+def get_recommender():
+    return CourseRecommender(
+        data_dir=DATA_DIR,
+        interactions={}
+    )
+
+
+# Защита общей модели при одновременных запросах
+recommendation_lock = Lock()
 
 
 @app.get("/courses")
 def get_courses(search: str | None = None, category: str | None = None):
-    result = courses
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM courses ORDER BY course_id"
+        ).fetchall()
 
-    # Поиск по названию курса
+    result = [dict(row) for row in rows]
+
     if search:
         result = [
             course for course in result
             if search.lower() in course["title"].lower()
         ]
 
-    # Фильтрация по категории
     if category:
         result = [
             course for course in result
-            if category.lower() in course["category"].lower()
+            if category.lower() in (course["category"] or "").lower()
         ]
 
     return result
 
 
-
 @app.get("/recommendations")
 def get_recommendations(user_id: int):
-    # Временные рекомендации, позже подключим ML-модель
+    # Получаем историю пользователя из SQLite
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT course_id, weight FROM interactions WHERE user_id = ?",
+            (user_id,)
+        ).fetchall()
+
+    history = [
+        (int(course_id), float(weight))
+        for course_id, weight in rows
+    ]
+
+    # Передаём историю ML-модели
+    with recommendation_lock:
+        recommender = get_recommender()
+        recommender.interactions = {user_id: history}
+
+        ml_results = recommender.recommend(
+            user_id=user_id,
+            top_k=10
+        )
+
+    if not ml_results:
+        return []
+
+    course_ids = [item["course_id"] for item in ml_results]
+    placeholders = ", ".join("?" for _ in course_ids)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT course_id, title, category FROM courses "
+            f"WHERE course_id IN ({placeholders})",
+            course_ids
+        ).fetchall()
+
+    courses_by_id = {
+        row["course_id"]: dict(row)
+        for row in rows
+    }
+
     recommendations = []
 
-    for i, course in enumerate(courses):
-        recommendations.append({
-            **course,
-            "score": round(1.0 - i * 0.05, 2)
-        })
+    for item in ml_results:
+        course = courses_by_id.get(item["course_id"])
+
+        if course is not None:
+            recommendations.append({
+                "course_id": course["course_id"],
+                "title": course["title"],
+                "category": course["category"],
+                "score": item["score"]
+            })
 
     return recommendations
+
+
+@app.post("/interactions")
+def save_interaction(interaction: Interaction):
+    with sqlite3.connect(DB_PATH) as conn:
+        course = conn.execute(
+            "SELECT course_id FROM courses WHERE course_id = ?",
+            (interaction.course_id,)
+        ).fetchone()
+
+        if course is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Курс не найден"
+            )
+
+        conn.execute("""
+            INSERT INTO interactions (user_id, course_id, weight)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, course_id)
+            DO UPDATE SET weight = excluded.weight
+        """, (
+            interaction.user_id,
+            interaction.course_id,
+            interaction.weight
+        ))
+
+        conn.commit()
+
+    return {
+        "status": "saved",
+        "user_id": interaction.user_id,
+        "course_id": interaction.course_id,
+        "weight": interaction.weight
+    }
